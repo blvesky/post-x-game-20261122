@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NEON SNAKE — one prompt, one game</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #05030f; height: 100%; overflow: hidden; }
+  body { font-family: "JetBrains Mono", "Courier New", monospace; }
+  #wrap { position: relative; width: 1080px; height: 1920px; margin: 0 auto; background: radial-gradient(ellipse at 50% 30%, #12083a 0%, #05030f 70%); }
+  canvas { display: block; }
+  #hud { position: absolute; top: 0; left: 0; width: 1080px; padding: 56px 64px 0 64px; box-sizing: border-box; color: #fff; }
+  #title { font-size: 58px; font-weight: 800; letter-spacing: 6px; color: #39ff88; text-shadow: 0 0 24px #39ff88, 0 0 60px #00e5ff; }
+  #title span { color: #ff2fd6; text-shadow: 0 0 24px #ff2fd6; }
+  #stats { display: flex; gap: 48px; margin-top: 18px; font-size: 40px; }
+  #stats b { color: #ffe14d; font-size: 52px; }
+  #stats .lbl { color: #8f86c9; font-size: 26px; letter-spacing: 3px; }
+  #speedbar { margin-top: 22px; height: 14px; background: #1b1440; border-radius: 7px; overflow: hidden; }
+  #speedfill { height: 100%; width: 8%; background: linear-gradient(90deg, #39ff88, #00e5ff, #ff2fd6); transition: width .3s; }
+  #hint { position: absolute; bottom: 42px; left: 0; width: 1080px; text-align: center; color: #6f66a8; font-size: 30px; letter-spacing: 2px; }
+  #over { position: absolute; inset: 0; display: none; align-items: center; justify-content: center; flex-direction: column; background: rgba(5,3,15,.72); color: #fff; text-align: center; }
+  #over h1 { font-size: 96px; margin: 0; color: #ff2fd6; text-shadow: 0 0 30px #ff2fd6; letter-spacing: 4px; }
+  #over p { font-size: 44px; color: #ffe14d; }
+  #over small { font-size: 30px; color: #b9b2e8; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="game" width="1080" height="1920"></canvas>
+  <div id="hud">
+    <div id="title">NEON <span>SNAKE</span></div>
+    <div id="stats">
+      <div><div class="lbl">SCORE</div><b id="score">0</b></div>
+      <div><div class="lbl">ORBS</div><b id="orbs">0</b></div>
+      <div><div class="lbl">SPEED</div><b id="level">x1.0</b></div>
+    </div>
+    <div id="speedbar"><div id="speedfill"></div></div>
+  </div>
+  <div id="hint">ARROWS / WASD TO STEER &nbsp;·&nbsp; R TO RESTART</div>
+  <div id="over"><h1>GAME OVER</h1><p id="final">SCORE 0</p><small>press R or tap to play again</small></div>
+</div>
+<script>
+(function () {
+  "use strict";
+  var cv = document.getElementById("game");
+  var ctx = cv.getContext("2d");
+  var W = 1080, H = 1920, TOP = 340, BOTTOM = 1820;
+  var CELL = 54;                       // 20 cols x 27 rows of playfield
+  var COLS = 20, ROWS = Math.floor((BOTTOM - TOP) / CELL); // 27
+  var OX = (W - COLS * CELL) / 2, OY = TOP;
+
+  var params = new URLSearchParams(location.search);
+  var AUTOPILOT = params.get("autopilot") === "1";
+
+  var snake, dir, pending, orb, orbs, score, particles, floating, alive, over, tickMs, lastTick, rafId;
+  var hue = 140;
+
+  function reset() {
+    snake = [{ x: 10, y: 13 }, { x: 9, y: 13 }, { x: 8, y: 13 }, { x: 7, y: 13 }, { x: 6, y: 13 }];
+    dir = { x: 1, y: 0 }; pending = null;
+    orbs = 0; score = 0; particles = []; floating = [];
+    alive = true; over = false; tickMs = 150;
+    document.getElementById("over").style.display = "none";
+    spawnOrb();
+    updateHud();
+  }
+
+  function spawnOrb() {
+    var occupied = {};
+    snake.forEach(function (s) { occupied[s.x + "," + s.y] = 1; });
+    var x, y, guard = 0;
+    do { x = (Math.random() * COLS) | 0; y = (Math.random() * ROWS) | 0; guard++; }
+    while (occupied[x + "," + y] && guard < 500);
+    var colors = ["#39ff88", "#00e5ff", "#ff2fd6", "#ffe14d", "#7c5cff"];
+    orb = { x: x, y: y, color: colors[(Math.random() * colors.length) | 0], born: performance.now() };
+  }
+
+  function burst(cx, cy, color, n) {
+    for (var i = 0; i < n; i++) {
+      var a = Math.random() * Math.PI * 2, sp = 2 + Math.random() * 7;
+      particles.push({ x: cx, y: cy, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, life: 1, color: color, r: 2 + Math.random() * 5 });
+    }
+  }
+
+  function cellCenter(c) { return { x: OX + c.x * CELL + CELL / 2, y: OY + c.y * CELL + CELL / 2 }; }
+
+  function freeArea(fromX, fromY, body) {
+    // BFS flood fill over cells not occupied by the body (tail cell counts as free: it moves away)
+    var blocked = {};
+    for (var i = 0; i < body.length - 1; i++) { blocked[body[i].x + "," + body[i].y] = 1; }
+    var seen = {}, q = [[fromX, fromY]], n = 0;
+    seen[fromX + "," + fromY] = 1;
+    while (q.length) {
+      var c = q.shift(); n++;
+      [[1, 0], [-1, 0], [0, 1], [0, -1]].forEach(function (d) {
+        var ex = c[0] + d[0], ey = c[1] + d[1], k = ex + "," + ey;
+        if (ex < 0 || ey < 0 || ex >= COLS || ey >= ROWS || seen[k] || blocked[k]) return;
+        seen[k] = 1; q.push([ex, ey]);
+      });
+    }
+    return n;
+  }
+
+  function autopilot() {
+    if (!alive) return;
+    var head = snake[0];
+    var moves = [{ x: 1, y: 0 }, { x: -1, y: 0 }, { x: 0, y: 1 }, { x: 0, y: -1 }];
+    var best = null, bestScore = Infinity;
+    moves.forEach(function (m) {
+      if (m.x === -dir.x && m.y === -dir.y) return; // never reverse
+      var nx = head.x + m.x, ny = head.y + m.y;
+      if (nx < 0 || ny < 0 || nx >= COLS || ny >= ROWS) return;
+      var lethal = false;
+      for (var i = 0; i < snake.length - 1; i++) { if (snake[i].x === nx && snake[i].y === ny) { lethal = true; break; } }
+      if (lethal) return;
+      // never enter a pocket smaller than the snake: that is how greedy snakes die
+      var nextBody = [{ x: nx, y: ny }].concat(snake.slice(0, -1));
+      var room = freeArea(nx, ny, nextBody);
+      if (room < snake.length + 2) return;
+      var dist = Math.abs(nx - orb.x) + Math.abs(ny - orb.y);
+      var s = dist * 10 - room * 0.05;   // chase the orb, prefer open space
+      if (s < bestScore) { bestScore = s; best = m; }
+    });
+    if (best) pending = best;
+    else {
+      // no safe chase move: follow the tail to stay alive
+      var tail = snake[snake.length - 1];
+      moves.forEach(function (m) {
+        if (m.x === -dir.x && m.y === -dir.y) return;
+        var nx = head.x + m.x, ny = head.y + m.y;
+        if (nx < 0 || ny < 0 || nx >= COLS || ny >= ROWS) return;
+        var hit = false;
+        for (var i = 0; i < snake.length - 1; i++) { if (snake[i].x === nx && snake[i].y === ny) { hit = true; break; } }
+        if (hit) return;
+        var d = Math.abs(nx - tail.x) + Math.abs(ny - tail.y);
+        if (d < bestScore) { bestScore = d; best = m; }
+      });
+      if (best) pending = best;
+    }
+  }
+
+  function step() {
+    if (!alive) return;
+    if (AUTOPILOT) autopilot();
+    if (pending) { dir = pending; pending = null; }
+    var head = { x: snake[0].x + dir.x, y: snake[0].y + dir.y };
+    if (head.x < 0 || head.y < 0 || head.x >= COLS || head.y >= ROWS) return die();
+    for (var i = 0; i < snake.length; i++) {
+      if (snake[i].x === head.x && snake[i].y === head.y) return die();
+    }
+    snake.unshift(head);
+    if (head.x === orb.x && head.y === orb.y) {
+      var c = cellCenter(head);
+      burst(c.x, c.y, orb.color, 26);
+      floating.push({ x: c.x, y: c.y - 10, life: 1, text: "+10" });
+      orbs++; score += 10;
+      if (orbs % 5 === 0) {           // speeds up every 5 orbs
+        tickMs = Math.max(62, tickMs - 12);
+        floating.push({ x: W / 2, y: OY + 120, life: 1.4, text: "SPEED UP!" });
+      }
+      spawnOrb();
+      updateHud();
+    } else {
+      snake.pop();
+    }
+  }
+
+  function die() {
+    alive = false; over = true; floating = [];
+    var c = cellCenter(snake[0]);
+    burst(c.x, c.y, "#ff2fd6", 40);
+    document.getElementById("final").textContent = "SCORE " + score + "  ·  " + orbs + " ORBS";
+    document.getElementById("over").style.display = "flex";
+    if (AUTOPILOT) { setTimeout(reset, 1200); } // keep the demo rolling
+  }
+
+  function updateHud() {
+    document.getElementById("score").textContent = score;
+    document.getElementById("orbs").textContent = orbs;
+    document.getElementById("level").textContent = "x" + (150 / tickMs).toFixed(1);
+    document.getElementById("speedfill").style.width = Math.min(100, (orbs / 40) * 100 + 8) + "%";
+  }
+
+  function draw(now) {
+    ctx.clearRect(0, 0, W, H);
+    // faint grid
+    ctx.strokeStyle = "rgba(124,92,255,0.10)";
+    ctx.lineWidth = 1;
+    for (var gx = 0; gx <= COLS; gx++) { ctx.beginPath(); ctx.moveTo(OX + gx * CELL, OY); ctx.lineTo(OX + gx * CELL, OY + ROWS * CELL); ctx.stroke(); }
+    for (var gy = 0; gy <= ROWS; gy++) { ctx.beginPath(); ctx.moveTo(OX, OY + gy * CELL); ctx.lineTo(OX + COLS * CELL, OY + gy * CELL); ctx.stroke(); }
+    ctx.strokeStyle = "rgba(0,229,255,0.55)"; ctx.lineWidth = 3;
+    ctx.shadowColor = "#00e5ff"; ctx.shadowBlur = 18;
+    ctx.strokeRect(OX - 6, OY - 6, COLS * CELL + 12, ROWS * CELL + 12);
+    ctx.shadowBlur = 0;
+    // orb: pulsing glow
+    var oc = cellCenter(orb);
+    var pulse = 1 + 0.22 * Math.sin(now / 160);
+    ctx.save();
+    ctx.shadowColor = orb.color; ctx.shadowBlur = 34;
+    ctx.fillStyle = orb.color;
+    ctx.beginPath(); ctx.arc(oc.x, oc.y, 15 * pulse, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = "#ffffff";
+    ctx.beginPath(); ctx.arc(oc.x, oc.y, 6 * pulse, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+    // snake: neon gradient body, glowing head
+    hue = (hue + 0.12) % 360;
+    for (var i = snake.length - 1; i >= 0; i--) {
+      var s = cellCenter(snake[i]);
+      var t = i / Math.max(1, snake.length - 1);
+      ctx.save();
+      ctx.shadowColor = i === 0 ? "#39ff88" : "#00e5ff"; ctx.shadowBlur = i === 0 ? 30 : 16;
+      ctx.fillStyle = i === 0 ? "#b6ffce" : "hsl(" + (150 + t * 130) + ",100%," + (62 - t * 18) + "%)";
+      var r = CELL / 2 - 4 - t * 5;
+      ctx.beginPath(); ctx.arc(s.x, s.y, Math.max(8, r), 0, Math.PI * 2); ctx.fill();
+      ctx.restore();
+    }
+    var hc = cellCenter(snake[0]);
+    ctx.fillStyle = "#05030f";
+    ctx.beginPath(); ctx.arc(hc.x - 8, hc.y - 8, 4.5, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(hc.x + 8, hc.y - 8, 4.5, 0, Math.PI * 2); ctx.fill();
+    // particles
+    particles = particles.filter(function (p) { return p.life > 0; });
+    particles.forEach(function (p) {
+      p.x += p.vx; p.y += p.vy; p.vx *= 0.96; p.vy *= 0.96; p.life -= 0.03;
+      ctx.save(); ctx.globalAlpha = Math.max(0, p.life);
+      ctx.shadowColor = p.color; ctx.shadowBlur = 14; ctx.fillStyle = p.color;
+      ctx.beginPath(); ctx.arc(p.x, p.y, p.r * p.life + 1, 0, Math.PI * 2); ctx.fill(); ctx.restore();
+    });
+    // floating texts
+    floating = floating.filter(function (f) { return f.life > 0; });
+    floating.forEach(function (f) {
+      f.y -= 1.2; f.life -= 0.02;
+      ctx.save(); ctx.globalAlpha = Math.max(0, Math.min(1, f.life));
+      ctx.fillStyle = "#ffe14d"; ctx.font = "800 44px 'JetBrains Mono', monospace";
+      ctx.textAlign = "center"; ctx.shadowColor = "#ffe14d"; ctx.shadowBlur = 18;
+      ctx.fillText(f.text, f.x, f.y); ctx.restore();
+    });
+  }
+
+  function loop(now) {
+    if (!lastTick) lastTick = now;
+    if (alive && now - lastTick >= tickMs) { step(); lastTick = now; }
+    draw(now);
+    rafId = requestAnimationFrame(loop);
+  }
+
+  var KEYS = { ArrowUp: { x: 0, y: -1 }, ArrowDown: { x: 0, y: 1 }, ArrowLeft: { x: -1, y: 0 }, ArrowRight: { x: 1, y: 0 },
+    w: { x: 0, y: -1 }, s: { x: 0, y: 1 }, a: { x: -1, y: 0 }, d: { x: 1, y: 0 } };
+  window.addEventListener("keydown", function (e) {
+    if (e.key === "r" || e.key === "R") { reset(); return; }
+    var m = KEYS[e.key] || KEYS[e.key.toLowerCase()];
+    if (m) { e.preventDefault(); if (!(m.x === -dir.x && m.y === -dir.y)) pending = m; }
+  });
+  cv.addEventListener("pointerdown", function () { if (over) reset(); });
+
+  // test / demo hooks (read-only state for the recording harness)
+  window.__snake = {
+    state: function () { return { score: score, orbs: orbs, alive: alive, tickMs: tickMs, len: snake.length, autopilot: AUTOPILOT, head: { x: snake[0].x, y: snake[0].y }, dir: { x: dir.x, y: dir.y } }; },
+    reset: reset
+  };
+
+  reset();
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
